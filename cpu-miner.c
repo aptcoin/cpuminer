@@ -106,7 +106,7 @@ enum algos {
 };
 
 static const char *algo_names[] = {
-	[ALGO_SCRYPT]		= "scrypt",
+	[ALGO_SCRYPT]		= "scrypt-nm",
 	[ALGO_SHA256D]		= "sha256d",
 };
 
@@ -275,6 +275,57 @@ static pthread_mutex_t g_work_lock;
 static bool submit_old = false;
 static char *lp_id;
 
+#define USING_SCRYPT_NM 1
+#define APTCOIN_TESTNET 0
+
+#if APTCOIN_TESTNET == 0
+static const int64_t apt_coin_start_time = 1408316143;
+#else
+static const int64_t apt_coin_start_time = 1407450750;
+#endif
+static const unsigned char min_n_factor = 5;
+static const unsigned char max_n_factor = 13;
+static const unsigned char n_diff = 8; // (max_n_factor - min_n_factor);                                                                                                
+static uint32_t TWO_YEARS_IN_SECONDS = (2 * 31536000);
+
+uint32_t n_factor_prevhash_tmp[8];
+static uint32_t n_factor_prevhash[8];
+static uint32_t n_factor_block_time = 1;
+
+static inline uint32_t maxtime(uint32_t a, unsigned long b)
+{
+    return ((a > b) ? a : b);
+}
+
+static inline unsigned int convert_prev_hash(unsigned char *hash_prev_block)
+{
+    unsigned int hpb = (unsigned int)swab32(*((uint32_t *)&hash_prev_block[28]));
+    return hpb;
+}
+
+static inline unsigned char get_n_factor(unsigned int hash_prev_block, uint32_t block_time)
+{
+    int64_t elapsed_time = 0;
+    unsigned char time_adjustment = 0;
+    unsigned char n_factor = min_n_factor;
+
+    //printf("block_time = %lld, apt_coin_start_time = %lld\n", block_time, apt_coin_start_time);
+    if ((apt_coin_start_time != -1) && (block_time >= apt_coin_start_time))
+    {
+        elapsed_time = (block_time - apt_coin_start_time);
+        // increment the step adjustment by one for roughly every 2 years                                                                                               
+        if ((elapsed_time % TWO_YEARS_IN_SECONDS) == 0)
+        {
+            time_adjustment = (unsigned char)(elapsed_time / TWO_YEARS_IN_SECONDS);
+        }
+        n_factor = (hash_prev_block % (n_diff + time_adjustment)) + min_n_factor;
+    }
+    /* printf("hash_prev_block = %u, max_n_factor = %d, n_factor = %d, time_adjustment[%lld] = %d\n", */
+    /*        hash_prev_block, (int)(max_n_factor + time_adjustment), (int)n_factor, */
+    /*        elapsed_time, (int)time_adjustment); */
+    return n_factor;
+}
+
 static inline void work_free(struct work *w)
 {
 	free(w->txs);
@@ -407,6 +458,11 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
 		goto out;
 	}
 
+        for(i = 0; i < 8; i++)
+        {
+            n_factor_prevhash[i] = prevhash[i];
+        }
+
 	tmp = json_object_get(val, "curtime");
 	if (!tmp || !json_is_integer(tmp)) {
 		applog(LOG_ERR, "JSON invalid curtime");
@@ -451,7 +507,10 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
 		int64_t cbvalue;
 		if (!pk_script_size) {
 			if (allow_getwork) {
+                            if (!USING_SCRYPT_NM)
+                            {
 				applog(LOG_INFO, "No payout address provided, switching to getwork");
+                            }
 				have_gbt = false;
 			} else
 				applog(LOG_ERR, "No payout address provided");
@@ -724,6 +783,8 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 
 		json_decref(val);
 	} else {
+            /* printf("Submitting VIA GETWORK (block_time=%u, Nonce=%u)\n", work->data[17], work->data[19]); */
+
 		/* build hex string */
 		for (i = 0; i < ARRAY_SIZE(work->data); i++)
 			le32enc(work->data + i, work->data[i]);
@@ -733,6 +794,8 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 		sprintf(s,
 			"{\"method\": \"getwork\", \"params\": [ \"%s\" ], \"id\":1}\r\n",
 			data_str);
+
+                printf("Submitting: %s\n", s);
 
 		/* issue JSON-RPC request */
 		val = json_rpc_call(curl, rpc_url, rpc_userpass, s, NULL, 0);
@@ -1082,20 +1145,13 @@ static void *miner_thread(void *userdata)
 		affine_to_cpu(thr_id, thr_id % num_processors);
 	}
 	
-	if (opt_algo == ALGO_SCRYPT) {
-		scratchbuf = scrypt_buffer_alloc(opt_scrypt_n);
-		if (!scratchbuf) {
-			applog(LOG_ERR, "scrypt buffer allocation failed");
-			pthread_mutex_lock(&applog_lock);
-			exit(1);
-		}
-	}
-
 	while (1) {
 		unsigned long hashes_done;
 		struct timeval tv_start, tv_end, diff;
 		int64_t max64;
 		int rc;
+                unsigned int hpb;
+                unsigned char n_factor;
 
 		if (have_stratum) {
 			while (time(NULL) >= g_work_time + 120)
@@ -1107,9 +1163,14 @@ static void *miner_thread(void *userdata)
 			int min_scantime = have_longpoll ? LP_SCANTIME : opt_scantime;
 			/* obtain new work from internal workio thread */
 			pthread_mutex_lock(&g_work_lock);
-			if (!have_stratum &&
+			if (!have_stratum && (USING_SCRYPT_NM ||
 			    (time(NULL) - g_work_time >= min_scantime ||
-			     work.data[19] >= end_nonce)) {
+			     work.data[19] >= end_nonce))) {
+                            /* NOTE: Scrypt-NM needs to always get new work since hashing relies on the previous hash and it may have been updated */
+                            if (USING_SCRYPT_NM)
+                            {
+                                have_gbt = true;
+                            }
 				if (unlikely(!get_work(mythr, &g_work))) {
 					applog(LOG_ERR, "work retrieval failed, exiting "
 						"mining thread %d", mythr->id);
@@ -1123,12 +1184,36 @@ static void *miner_thread(void *userdata)
 				continue;
 			}
 		}
+
+                if (opt_algo == ALGO_SCRYPT) {
+                    n_factor_block_time = maxtime(n_factor_block_time, time(NULL));
+                    hpb = convert_prev_hash((unsigned char *)n_factor_prevhash);
+                    n_factor = get_n_factor(hpb, n_factor_block_time);
+                    opt_scrypt_n = (1 << (n_factor + 1));
+
+                    if (scratchbuf)
+                    {
+                        free(scratchbuf);
+                        scratchbuf = NULL;
+                    }
+                    scratchbuf = scrypt_buffer_alloc(opt_scrypt_n);
+                    if (!scratchbuf) {
+			applog(LOG_ERR, "scrypt buffer allocation failed");
+			pthread_mutex_lock(&applog_lock);
+			exit(1);
+                    }
+                }
+
 		if (memcmp(work.data, g_work.data, 76)) {
 			work_free(&work);
 			work_copy(&work, &g_work);
 			work.data[19] = 0xffffffffU / opt_n_threads * thr_id;
 		} else
 			work.data[19]++;
+
+                if (opt_algo == ALGO_SCRYPT)
+                    work.data[17] = swab32(n_factor_block_time);
+
 		pthread_mutex_unlock(&g_work_lock);
 		work_restart[thr_id].restart = 0;
 		
@@ -1186,8 +1271,8 @@ static void *miner_thread(void *userdata)
 		if (!opt_quiet) {
 			sprintf(s, thr_hashrates[thr_id] >= 1e6 ? "%.0f" : "%.2f",
 				1e-3 * thr_hashrates[thr_id]);
-			applog(LOG_INFO, "thread %d: %lu hashes, %s khash/s",
-				thr_id, hashes_done, s);
+			applog(LOG_INFO, "thread %d: %lu hashes, %s khash/s [n_factor=%d, hpb=%u]",
+                               thr_id, hashes_done, s, (n_factor + 1), hpb);
 		}
 		if (opt_benchmark && thr_id == opt_n_threads - 1) {
 			double hashrate = 0.;
@@ -1200,11 +1285,16 @@ static void *miner_thread(void *userdata)
 		}
 
 		/* if nonce found, submit work */
-		if (rc && !opt_benchmark && !submit_work(mythr, &work))
-			break;
+                if (rc && !opt_benchmark && !submit_work(mythr, &work))
+                        break;
 	}
 
 out:
+        if (scratchbuf)
+        {   
+            free(scratchbuf);
+            scratchbuf = NULL;
+        }
 	tq_freeze(mythr->q);
 
 	return NULL;
