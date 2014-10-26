@@ -687,7 +687,7 @@ static void share_result(int result, const char *reason)
 		hashrate += thr_hashrates[i];
 	result ? accepted_count++ : rejected_count++;
 	pthread_mutex_unlock(&stats_lock);
-	
+
 	sprintf(s, hashrate >= 1e6 ? "%.0f" : "%.2f", 1e-3 * hashrate);
 	applog(LOG_INFO, "accepted: %lu/%lu (%.2f%%), %s khash/s %s",
 		   accepted_count,
@@ -783,8 +783,6 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 
 		json_decref(val);
 	} else {
-            /* printf("Submitting VIA GETWORK (block_time=%u, Nonce=%u)\n", work->data[17], work->data[19]); */
-
 		/* build hex string */
 		for (i = 0; i < ARRAY_SIZE(work->data); i++)
 			le32enc(work->data + i, work->data[i]);
@@ -1094,7 +1092,10 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 	memset(work->data, 0, 128);
 	work->data[0] = le32dec(sctx->job.version);
 	for (i = 0; i < 8; i++)
+        {
 		work->data[1 + i] = le32dec((uint32_t *)sctx->job.prevhash + i);
+                n_factor_prevhash[7-i] = le32dec((uint32_t *)sctx->job.prevhash + i);
+        }
 	for (i = 0; i < 8; i++)
 		work->data[9 + i] = be32dec((uint32_t *)merkle_root + i);
 	work->data[17] = le32dec(sctx->job.ntime);
@@ -1157,8 +1158,6 @@ static void *miner_thread(void *userdata)
 			while (time(NULL) >= g_work_time + 120)
 				sleep(1);
 			pthread_mutex_lock(&g_work_lock);
-			if (work.data[19] >= end_nonce && !memcmp(work.data, g_work.data, 76))
-				stratum_gen_work(&stratum, &g_work);
 		} else {
 			int min_scantime = have_longpoll ? LP_SCANTIME : opt_scantime;
 			/* obtain new work from internal workio thread */
@@ -1212,7 +1211,12 @@ static void *miner_thread(void *userdata)
 			work.data[19]++;
 
                 if (opt_algo == ALGO_SCRYPT)
-                    work.data[17] = swab32(n_factor_block_time);
+                {
+                    if (!have_stratum)
+                    {
+                        work.data[17] = swab32(n_factor_block_time);
+                    }
+                }
 
 		pthread_mutex_unlock(&g_work_lock);
 		work_restart[thr_id].restart = 0;
